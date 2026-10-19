@@ -1,0 +1,46 @@
+# Stores for the MTG singles bot.
+#
+# One store per line, with the parts separated by the | character:
+#
+#   Name | Website | Collection | Options
+#
+#   Name        any name you like. It shows in the report.
+#   Website     the store's web address, for example https://example.com.au
+#               You can paste a whole collection address here instead, for example
+#               https://example.com.au/collections/mtg-singles, and leave Collection empty.
+#   Collection  the last part of the collection address. Separate several with commas.
+#               Use * to read the whole store (the bot keeps only the Magic cards).
+#   Options     optional, separated by commas:
+#                 first   stop at the first collection that works, the others are only fallbacks
+#                 off     skip this line without deleting it
+#
+# To add a store: copy a line, change it, and save. A check runs on GitHub within a minute and shows
+# whether the store can be read. Lines starting with # are ignored.
+# To find a store's collection names, open Actions, choose "Check stores", select Run workflow,
+# and type the store's website in the box.
+# To add another collection to a store that is already listed, write another line with the same name
+# and website.
+#
+
+Shuffled | https://shuffled.com.au | mtg-singles-instock
+Kastle Cards and Games | https://kastlecardsandgames.com | *
+Good Games Adelaide | https://ggadelaide.com.au | mtg-singles-instock
+The Cardhub Australia | https://thecardhubaustralia.com.au | mtg-singles
+Moon MTG | https://moonmtg.com | cards-in-stock
+Card Traders Australia | https://cardtradersaustralia.com.au | *
+Good Games TCG | https://tcg.goodgames.com.au | mtg-singles-instock, mtg-singles-all-products | first
+Pro Gamers | https://progamers.com.au | mtg-singles-instock
+Cherry Collectables | https://www.cherrycollectables.com.au | magic-the-gathering-singles
+Gameology | https://www.gameology.com.au | magic-the-gathering-singles
+The Card Cave | https://thecardcave.com.au | magic-singles
+Mint Collectables | https://mintcollectables.com.au | magic-the-gathering-singles
+Ozzie Collectables | https://www.ozziecollectables.com | mtg-singles
+Mana Market | https://manamarket.com.au | magic-the-gathering-singles
+Mana Masters | https://www.manamasters.com.au | tcg-singles
+Urban Empire | https://urbanempirecollectables.com | magic-the-gathering-singles
+MTG Singles Australia | https://www.mtgsinglesaustralia.com | *
+Arcane Alfred | https://www.arcanealfred.com.au | *
+Jenes MTG | https://jenesmtg.com.au | *
+ManaCat | https://manacat.com.au | *
+Gumnut TCG | https://tcg.gumnut.com.au | *
+That Game Store | https://thatgamestore.com.au | *
