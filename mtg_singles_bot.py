@@ -24,7 +24,8 @@ Stores are read in parallel (one worker per store, one request per second per st
 Usage:
     python mtg_singles_bot.py --dry-run                  # builds report.html, sends nothing
     python mtg_singles_bot.py --dry-run --max-pages 2    # quick test, 2 pages per collection
-    python mtg_singles_bot.py --dry-run --new-days 7     # treat the last 7 days as new
+    python mtg_singles_bot.py --dry-run --new-days 7     # widen the window to 7 days
+    python mtg_singles_bot.py --dry-run --new-mode calendar   # measure the window back from today instead
     python mtg_singles_bot.py                            # builds the report and emails it
 """
 import argparse
@@ -85,8 +86,15 @@ SHOPIFY_STORES = [
 ]
 
 # A listing counts as new if its product was created or published, or its variant was created,
-# within this many days. Set to 0 to turn the restriction off and look at every listing.
+# inside the window below. Set NEW_WITHIN_DAYS to 0 to turn the restriction off.
+#   NEW_MODE "store":    the window is measured back from EACH STORE'S OWN newest listing. A store whose
+#                        newest listing is 20 days old still contributes its latest batch.
+#   NEW_MODE "calendar": the window is measured back from today, the same for every store.
 NEW_WITHIN_DAYS = 2
+NEW_MODE = "store"
+# In "store" mode, ignore a store entirely if its newest listing is older than this many days
+# (0 = never ignore). Stock that old is probably no longer a fresh mispricing.
+MAX_STORE_AGE_DAYS = 0
 # What counts as a wide spread that involves a new listing (all must be true).
 MIN_STORES_SPREAD = 2        # stores that have the card in stock
 MIN_SPREAD_RATIO = 1.5       # highest price is at least 1.5 times the lowest
@@ -147,6 +155,47 @@ def is_new(rec, now, days):
         return True
     added = rec.get("added")
     return bool(added) and added >= now - timedelta(days=days)
+
+
+def store_anchors(records, now):
+    """Each store's newest listing date, never later than now (a bad date in the future is clamped)."""
+    newest = {}
+    for r in records:
+        a = r.get("added")
+        if a and (r["store"] not in newest or a > newest[r["store"]]):
+            newest[r["store"]] = a
+    return {s: min(a, now) for s, a in newest.items()}
+
+
+def make_is_new(records, now, days, mode=None):
+    """Returns a function that says whether a listing counts as new, under the chosen mode."""
+    mode = mode or NEW_MODE
+    anchors = store_anchors(records, now) if mode == "store" else {}
+
+    def check(r):
+        if days <= 0:
+            return True
+        added = r.get("added")
+        if not added:
+            return False
+        end = now
+        if mode == "store":
+            end = anchors.get(r["store"])
+            if end is None:
+                return False
+            if MAX_STORE_AGE_DAYS > 0 and end < now - timedelta(days=MAX_STORE_AGE_DAYS):
+                return False
+        return added >= end - timedelta(days=days)
+
+    return check
+
+
+def fmt_age(dt, now=None):
+    if not dt:
+        return ""
+    now = now or datetime.now(timezone.utc)
+    d = int((now - dt).total_seconds() // 86400)
+    return "today" if d <= 0 else f"{d}d ago"
 
 
 def fmt_added(dt):
@@ -727,14 +776,50 @@ def best_per_store(recs):
     return best
 
 
-def analyse(records, book, now=None, days=None):
-    """Returns (spreads, cheaps). Both only include cards with at least one new listing."""
+def review_row(r, kind, why, **extra):
+    """A review row for a new listing that could not be compared at all."""
+    return {"kind": kind, "why": why, "store": r["store"], "name": r["name"],
+            "set": r.get("set_id") or "", "price": r["price"], "added": r.get("added"),
+            "url": r["url"], "gap": None, "saving": None, "median": None, "n_others": 0, **extra}
+
+
+def judge_new_listing(row, ranked, i):
+    """Says whether the new listing at ranked[i] would be flagged, using the same rules as the report."""
+    r = ranked[i]
+    others = [x["price"] for j, x in enumerate(ranked) if j != i]
+    med = statistics.median(others)
+    gap = 1 - r["price"] / med if med > 0 else 0.0
+    saving = med - r["price"]
+    need = MIN_CHEAP_GAP if len(others) >= 2 else MIN_CHEAP_GAP_ONE_OTHER
+    base = {"store": r["store"], "name": row["name"], "set": row["set"], "price": r["price"],
+            "added": r.get("added"), "url": r["url"], "gap": gap, "saving": saving, "median": med,
+            "n_others": len(others), "need": need, "number": row["number"]}
+    if i != 0:
+        return {**base, "kind": "not_cheapest",
+                "why": f"not the cheapest: {ranked[0]['store']} has it for {money(ranked[0]['price'])}"}
+    if len(others) < MIN_OTHERS_NEW:
+        return {**base, "kind": "alone", "why": "no other store has this exact card in stock"}
+    if gap < need:
+        return {**base, "kind": "gap",
+                "why": f"only {gap:.0%} below the median of {len(others)} other store(s), needs {need:.0%}"}
+    if saving < MIN_CHEAP_SAVING:
+        return {**base, "kind": "saving",
+                "why": f"saves only {money(saving)} against the median, needs {money(MIN_CHEAP_SAVING)}"}
+    return {**base, "kind": "flagged", "why": "flagged"}
+
+
+def analyse(records, book, now=None, days=None, review=None):
+    """Returns (spreads, cheaps). Both only include cards with at least one new listing.
+    If `review` is a list, one row per new listing is appended to it, saying how it was judged."""
     now = now or datetime.now(timezone.utc)
     days = NEW_WITHIN_DAYS if days is None else days
+    newf = make_is_new(records, now, days)
     prepare(records, book)
     groups = defaultdict(list)
     for r in records:
         if not r["set_id"]:
+            if review is not None and newf(r):
+                review.append(review_row(r, "no_set", "its set could not be worked out from the listing"))
             continue  # without a set, different printings could be mixed up
         groups[(r["name_key"], r["set_id"], r["foil"], r["finishes"])].append(r)
 
@@ -760,13 +845,22 @@ def analyse(records, book, now=None, days=None):
                 subs[owners[0]].extend(urs)
             elif not owners:
                 loose_groups.append(urs)
-            # several printings could be meant: skipped rather than guessed
+            elif review is not None:
+                # several printings could be meant: skipped rather than guessed
+                for r in urs:
+                    if newf(r):
+                        review.append(review_row(r, "ambiguous", "no collector number and several printings exist, "
+                                                                  "so it cannot be matched safely"))
         for sub in list(subs.values()) + loose_groups:
             best = best_per_store(sub)  # cheapest in-stock listing at each store
             if len(best) < 2:
+                if review is not None:
+                    for r in best.values():
+                        if newf(r):
+                            review.append(review_row(r, "alone", "no other store has this exact card in stock"))
                 continue
             ranked = sorted(best.values(), key=lambda r: r["price"])
-            flags = [is_new(r, now, days) for r in ranked]
+            flags = [newf(r) for r in ranked]
             if not any(flags):
                 continue  # nothing new about this card, so it is not what we are looking for
             prices = [r["price"] for r in ranked]
@@ -783,6 +877,10 @@ def analyse(records, book, now=None, days=None):
             }
             if len(best) >= MIN_STORES_SPREAD and row["ratio"] >= MIN_SPREAD_RATIO and row["spread"] >= MIN_SPREAD_ABS:
                 spreads.append(row)
+            if review is not None:
+                for i, (r, is_n) in enumerate(zip(ranked, flags)):
+                    if is_n:
+                        review.append(judge_new_listing(row, ranked, i))
             others = prices[1:]
             if flags[0] and len(others) >= MIN_OTHERS_NEW:
                 med = statistics.median(others)
@@ -798,6 +896,7 @@ def analyse(records, book, now=None, days=None):
 
 def count_stats(records, stats, now, days):
     """Fills in the per-store counts used by the Store check table. Call after analyse()."""
+    newf = make_is_new(records, now, days)
     for r in records:
         st = stats[r["store"]]
         if r.get("set_id"):
@@ -808,7 +907,7 @@ def count_stats(records, stats, now, days):
             st["dated"] += 1
             if st["newest"] is None or r["added"] > st["newest"]:
                 st["newest"] = r["added"]
-        if is_new(r, now, days):
+        if newf(r):
             st["new"] += 1
 
 
@@ -844,8 +943,14 @@ def store_summary(stats):
             if NEW_WITHIN_DAYS > 0:
                 newest = s.get("newest")
                 if newest is not None and newest < datetime.now(timezone.utc) - timedelta(days=STALE_NEWEST_DAYS):
+                    extra = (" Its latest batch is still compared, but it may be old stock."
+                             if NEW_MODE == "store" and MAX_STORE_AGE_DAYS <= 0 else "")
                     problems.append(f"{name}: its newest listing is over {STALE_NEWEST_DAYS} days old, so its added "
-                                    f"dates may not be updating")
+                                    f"dates may not be updating.{extra}")
+                if NEW_MODE == "store" and MAX_STORE_AGE_DAYS > 0 and newest is not None and \
+                        newest < datetime.now(timezone.utc) - timedelta(days=MAX_STORE_AGE_DAYS):
+                    problems.append(f"{name}: left out of the new-listing check because its newest listing is over "
+                                    f"{MAX_STORE_AGE_DAYS} days old")
                 if s["dated"] == 0:
                     problems.append(f"{name}: its listings carry no added dates, so none can be judged as new")
                 elif s["kept"] >= 50 and s["new"] > 0.5 * s["kept"]:
@@ -868,14 +973,19 @@ def prices_cell(entries):
     return "<br>".join(out)
 
 
-def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None):
+def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, review=None):
     now = now or datetime.now(timezone.utc)
     days = NEW_WITHIN_DAYS
     working, total, problems = store_summary(stats)
     kept = sum(s["kept"] for s in stats.values())
     new_total = sum(s["new"] for s in stats.values())
     when = now.astimezone(TZ).strftime("%a %d %b %Y")
-    if days > 0:
+    if days > 0 and NEW_MODE == "store":
+        parts = [f"<p>{new_total} of {kept} in-stock English NM listings are each store's latest additions "
+                 f"(added within {days} day(s) of that store's own newest listing). "
+                 f"Each one was compared with the cheapest price at every other store. "
+                 f"{working} of {total} stores were read on {when}.</p>"]
+    elif days > 0:
         parts = [f"<p>{new_total} of {kept} in-stock English NM listings were added in the last {days} day(s). "
                  f"Each one was compared with the cheapest price at every other store. "
                  f"{working} of {total} stores were read on {when}.</p>"]
@@ -885,6 +995,10 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None):
     tbl = '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse;font-size:13px">'
 
     parts.append("<h3>New listings priced well below the other stores</h3>")
+    parts.append(f"<p>A new listing is flagged when it is the cheapest price for that card at every store that has "
+                 f"it, at least {MIN_CHEAP_GAP:.0%} below the median of the other stores "
+                 f"({MIN_CHEAP_GAP_ONE_OTHER:.0%} if only one other store has it), and saves at least "
+                 f"{money(MIN_CHEAP_SAVING)} against that median.</p>")
     if cheaps:
         parts.append(tbl + "<tr><th>Card</th><th>Set, finish</th><th>New listing</th><th>Median of others</th>"
                      "<th>Saving</th><th>All prices</th></tr>")
@@ -896,7 +1010,7 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None):
             plural = "" if r["n_others"] == 1 else "s"
             parts.append(
                 f"<tr><td>{card_cell(r)}</td><td>{escape(r['set'])}, {escape(r['finish'])}</td>"
-                f"<td>{money(r['lo'])}<br>{escape(first[0])}<br>added {fmt_added(r['added'])}</td>"
+                f"<td>{money(r['lo'])}<br>{escape(first[0])}<br>added {fmt_added(r['added'])} ({fmt_age(r['added'], now)})</td>"
                 f"<td>{money(r['median_others'])}<br>({r['n_others']} other store{plural}){weak}</td>"
                 f"<td>{money(r['saving'])} ({r['gap']:.0%})</td><td>{prices_cell(r['entries'])}</td></tr>")
         parts.append("</table>")
@@ -926,16 +1040,47 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None):
     else:
         parts.append("<p>None today.</p>")
 
+    if review is not None:
+        parts.append("<h3>How each new listing was judged</h3>")
+        labels = [("flagged", "flagged (shown above)"), ("alone", "no other store has the exact card in stock"),
+                  ("no_set", "set could not be worked out"), ("ambiguous", "no collector number, several printings"),
+                  ("not_cheapest", "another store is cheaper"), ("gap", "gap below the threshold"),
+                  ("saving", "saving below the dollar minimum")]
+        counts = defaultdict(int)
+        for x in review:
+            counts[x["kind"]] += 1
+        if review:
+            parts.append("<ul>" + "".join(f"<li>{counts[k]}: {escape(t)}</li>" for k, t in labels if counts[k]) + "</ul>")
+            near = sorted([x for x in review if x["kind"] in ("not_cheapest", "gap", "saving")],
+                          key=lambda x: x["gap"], reverse=True)
+            if near:
+                parts.append("<p>Closest to being flagged (the gap is measured against the median of the other stores):</p>")
+                parts.append(tbl + "<tr><th>Card</th><th>New listing</th><th>Median of others</th><th>Gap</th>"
+                             "<th>Saving</th><th>Why it was not flagged</th></tr>")
+                for x in near[:25]:
+                    plural = "" if x["n_others"] == 1 else "s"
+                    parts.append(
+                        f"<tr><td><a href=\"{escape(x['url'])}\">{escape(x['name'])}</a> "
+                        f"<span style=\"color:#666\">({escape(str(x['set']))}"
+                        f"{', #' + escape(str(x['number'])) if x.get('number') else ''})</span></td>"
+                        f"<td>{money(x['price'])}<br>{escape(x['store'])}<br>added {fmt_added(x['added'])} ({fmt_age(x['added'], now)})</td>"
+                        f"<td>{money(x['median'])}<br>({x['n_others']} other store{plural})</td>"
+                        f"<td>{x['gap']:.0%}</td><td>{money(x['saving'])}</td><td>{escape(x['why'])}</td></tr>")
+                parts.append("</table>")
+        else:
+            parts.append("<p>There were no new listings to judge.</p>")
+
     parts.append("<h3>Store check</h3>")
     parts.append(tbl + "<tr><th>Store</th><th>Pages</th><th>Products</th><th>In-stock variants</th>"
                  f"<th>Kept (NM, English)</th><th>With a set</th><th>With a number</th>"
-                 f"<th>With an added date</th><th>New ({days}d)</th><th>Newest listing</th></tr>")
+                 f"<th>With an added date</th><th>{'Latest batch' if NEW_MODE == 'store' else 'New'} ({days}d)</th>"
+                 f"<th>Newest listing</th></tr>")
     for name, s in stats.items():
         trunc = " (hit page limit)" if s["truncated"] else ""
         parts.append(f"<tr><td>{escape(name)}</td><td>{s['pages']}{trunc}</td><td>{s['products']}</td>"
                      f"<td>{s['in_stock']}</td><td>{s['kept']}</td><td>{s['with_set']}</td>"
                      f"<td>{s['with_number']}</td><td>{s['dated']}</td><td>{s['new']}</td>"
-                     f"<td>{fmt_added(s.get('newest'))}</td></tr>")
+                     f"<td>{fmt_added(s.get('newest'))} ({fmt_age(s.get('newest'), now)})</td></tr>")
     parts.append("</table>")
 
     if problems:
@@ -1009,28 +1154,38 @@ def send_mail(subject, html):
 
 
 def main():
-    global NEW_WITHIN_DAYS
+    global NEW_WITHIN_DAYS, NEW_MODE
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="write report.html instead of emailing")
     parser.add_argument("--max-pages", type=int, default=None, help="pages per collection (quick test)")
     parser.add_argument("--new-days", type=int, default=None,
-                        help="listings added in the last N days count as new (0 turns the restriction off)")
+                        help="size of the new-listing window in days (0 turns the restriction off)")
+    parser.add_argument("--new-mode", choices=["store", "calendar"], default=None,
+                        help="store: window ends at each store's newest listing. calendar: window ends today")
     args = parser.parse_args()
     if args.new_days is not None:
         NEW_WITHIN_DAYS = max(0, args.new_days)
+    if args.new_mode:
+        NEW_MODE = args.new_mode
     now = datetime.now(timezone.utc)
 
     book = SetBook()
     loaded, err = (load_scryfall_sets(book) if USE_SCRYFALL else (0, "turned off"))
     records, stats, samples = fetch_all(args.max_pages, book)
-    spreads, cheaps = analyse(records, book, now)
+    review = []
+    spreads, cheaps = analyse(records, book, now, review=review)
     count_stats(records, stats, now, NEW_WITHIN_DAYS)
 
     notes = [
         "Only in-stock, English, Near Mint listings are compared. If a store does not state a condition, NM is assumed.",
-        "A listing counts as new when the store's feed says its product was created or published, or its variant "
-        "was created, inside the window. Stores can reset these dates when they re-import stock, so watch the "
-        "New column in the Store check table.",
+        ("A listing counts as new when the store's feed says its product was created or published, or its variant "
+         "was created, within the window. In per-store mode the window is measured back from each store's own "
+         "newest listing, so a store that has not added stock lately still contributes its latest batch, and the "
+         "age shown next to each listing tells you how old that batch is. Stores can reset these dates when they "
+         "re-import stock, so watch the Latest batch column in the Store check table.") if NEW_MODE == "store" else
+        ("A listing counts as new when the store's feed says its product was created or published, or its variant "
+         "was created, inside the window. Stores can reset these dates when they re-import stock, so watch the "
+         "New column in the Store check table."),
         "Each new listing is compared with the cheapest in-stock price at every other store, new or old. "
         "A new listing that no other store carries cannot be judged, so it does not appear.",
         "Stores marked as whole-store feeds are read from their full product list and filtered to Magic cards "
@@ -1044,7 +1199,7 @@ def main():
     ]
     working, total, _ = store_summary(stats)
     new_total = sum(s["new"] for s in stats.values())
-    html = build_html(spreads, cheaps, stats, notes, book, samples if args.dry_run else None, now)
+    html = build_html(spreads, cheaps, stats, notes, book, samples if args.dry_run else None, now, review)
     subject = (f"MTG new singles: {len(cheaps)} cheap new listing(s), {len(spreads)} spread(s), "
                f"{new_total} new scanned, {working}/{total} stores OK")
     if args.dry_run:
