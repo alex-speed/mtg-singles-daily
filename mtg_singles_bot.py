@@ -4,10 +4,12 @@ MTG singles bot.
 
 Reads single-card listings from Australian stores and works out which listings are the same
 card (same name, set, foil type, treatment and collector number). Because most bargains are
-mispriced new additions, it looks only at listings ADDED in the last few days (default 2) and
-compares each one with the cheapest price at every other store. It reports:
+mispriced new additions, it looks only at each store's latest additions and compares each one
+with the cheapest price at every other store. It reports:
   1. New listings priced well below the other stores.
-  2. Wide price spreads that involve a new listing.
+  2. New listings whose SET IS UNKNOWN but which look cheap against the same card in other sets
+     or stores. These need a manual set check, but they are not skipped.
+  3. Wide price spreads that involve a new listing.
 Only English, Near Mint, in-stock listings are compared. The report also shows how well each
 store was read, so you can see which stores need fixing.
 
@@ -100,7 +102,7 @@ MIN_STORES_SPREAD = 2        # stores that have the card in stock
 MIN_SPREAD_RATIO = 1.5       # highest price is at least 1.5 times the lowest
 MIN_SPREAD_ABS = 8.00        # and at least this many dollars higher
 # What counts as a cheap new listing (all must be true). It must be the cheapest listing of the
-# card across all stores, and a new listing.
+# card across all stores, and a new listing. The same rules judge listings whose set is unknown.
 MIN_OTHERS_NEW = 1           # at least this many other stores must also stock the card
 MIN_CHEAP_GAP = 0.25         # 25% or more below the median of the other stores
 MIN_CHEAP_GAP_ONE_OTHER = 0.35  # a stricter gap when only one other store can be compared
@@ -112,7 +114,7 @@ COMPARE_CONDITIONS = {"NM"}  # only these conditions are compared
 MAX_PAGES = 140              # pages of 250 products per collection
 REQUEST_DELAY = 1.0          # seconds to wait between requests, to be polite to small shops
 TIMEOUT_SECONDS = 30
-MAX_WORKERS = 6               # stores read at the same time
+MAX_WORKERS = 6              # stores read at the same time
 STALE_NEWEST_DAYS = 45       # warn if a store's newest listing is older than this
 TIME_BUDGET_SECONDS = 1500   # stop fetching after 25 minutes so the job always finishes
 USE_SCRYFALL = True          # one request for the list of set names and codes
@@ -150,7 +152,7 @@ def latest_dt(*values):
 
 
 def is_new(rec, now, days):
-    """True if the listing was added within `days` days. With days = 0 everything counts as new."""
+    """True if the listing was added within `days` days of now. With days = 0 everything counts as new."""
     if days <= 0:
         return True
     added = rec.get("added")
@@ -643,6 +645,7 @@ def records_from_product(store, base, p, st, samples, need_mtg=False, book=None)
                "name": parsed["name"], "name_key": parsed["name_key"], "set_code": parsed["set_code"],
                "set_texts": parsed["set_texts"], "loose": loose, "number": parsed["number"],
                "frames": parsed["frames"], "finishes": parsed["finishes"],
+               "sku": v.get("sku") or "", "vtext": vtext,
                "uid": (store, p.get("handle", ""), v.get("id"))}
         out.append(rec)
         st["kept"] += 1
@@ -808,19 +811,104 @@ def judge_new_listing(row, ranked, i):
     return {**base, "kind": "flagged", "why": "flagged"}
 
 
-def analyse(records, book, now=None, days=None, review=None):
+def card_key(r):
+    return (r["name_key"], r["foil"], r["finishes"])
+
+
+def loose_compare(L, pool, book, only_unset=False):
+    """
+    Compares listing L with other stores' listings of the same card when the set cannot be matched
+    exactly. Candidates must share the card name, foil type, finish and treatment words, and the
+    collector number when both listings show one. Candidates are grouped by set, because the
+    listing could belong to any of them. L is judged against each group with the normal rules and
+    the group that gives the biggest saving is reported, together with every set it could be.
+    Returns a row, or None if there is nothing to compare with.
+    only_unset=True limits the candidates to other stores' listings that have no set either.
+    """
+    cands = [c for c in pool.get(card_key(L), [])
+             if c["store"] != L["store"] and c["frames"] == L["frames"]
+             and not (L["number"] and c["number"] and L["number"] != c["number"])]
+    if only_unset:
+        cands = [c for c in cands if not c["set_id"]]
+    by_set = defaultdict(list)
+    for c in cands:
+        by_set[c["set_id"] or ""].append(c)
+    options = []
+    for sid, cs in by_set.items():
+        best = best_per_store(cs)
+        if len(best) < MIN_OTHERS_NEW:
+            continue
+        ranked = sorted(best.values(), key=lambda x: x["price"])
+        prices = [x["price"] for x in ranked]
+        med = statistics.median(prices)
+        gap = 1 - L["price"] / med if med > 0 else 0.0
+        saving = med - L["price"]
+        need = MIN_CHEAP_GAP if len(prices) >= 2 else MIN_CHEAP_GAP_ONE_OTHER
+        cheapest = L["price"] <= prices[0]
+        options.append({
+            "label": "set unknown" if not sid else set_label(sid, ranked[0], book),
+            "n": len(prices), "median": med, "lowest": prices[0], "gap": gap, "saving": saving,
+            "need": need, "cheapest": cheapest,
+            "ok": cheapest and gap >= need and saving >= MIN_CHEAP_SAVING,
+            "entries": [(x["store"], x["price"], x["url"]) for x in ranked]})
+    if not options:
+        return None
+    passing = [o for o in options if o["ok"]]
+    pick = max(passing, key=lambda o: o["saving"]) if passing else max(options, key=lambda o: o["gap"])
+    if passing:
+        why = "possible discount, check the set by hand"
+    elif not pick["cheapest"]:
+        why = f"not the cheapest: {pick['entries'][0][0]} has a matching card for {money(pick['lowest'])}"
+    elif pick["gap"] < pick["need"]:
+        why = f"only {pick['gap']:.0%} below the median of {pick['n']} other store(s), needs {pick['need']:.0%}"
+    else:
+        why = f"saves only {money(pick['saving'])} against the median, needs {money(MIN_CHEAP_SAVING)}"
+    return {
+        "kind": "loose_flagged" if passing else "loose_other", "why": why,
+        "store": L["store"], "name": L["name"], "number": L["number"] or "",
+        "set": set_label(L["set_id"], L, book) if L["set_id"] else "set unknown",
+        "known": bool(L["set_id"]), "price": L["price"], "added": L.get("added"), "url": L["url"],
+        "finish": finish_label(L["foil"], L["finishes"]), "frames": ", ".join(sorted(L["frames"])),
+        "gap": pick["gap"], "saving": pick["saving"], "median": pick["median"], "n_others": pick["n"],
+        "need": pick["need"], "best_set": pick["label"], "n_sets": len(options),
+        "sets": [(o["label"], o["median"], o["n"])
+                 for o in sorted(options, key=lambda o: o["median"], reverse=True)[:5]],
+        "entries": pick["entries"]}
+
+
+def analyse(records, book, now=None, days=None, review=None, loose=None):
     """Returns (spreads, cheaps). Both only include cards with at least one new listing.
-    If `review` is a list, one row per new listing is appended to it, saying how it was judged."""
+    If `review` is a list, one row per new listing is appended to it, saying how it was judged.
+    If `loose` is a list, new listings whose set is unknown (or whose only match has no set) are
+    compared by name, finish and treatment, and the possible discounts are appended to it."""
     now = now or datetime.now(timezone.utc)
     days = NEW_WITHIN_DAYS if days is None else days
     newf = make_is_new(records, now, days)
     prepare(records, book)
+    pool = defaultdict(list)
+    for r in records:
+        pool[card_key(r)].append(r)
+
+    def run_loose(L, only_unset, fallback_kind, fallback_why):
+        row = loose_compare(L, pool, book, only_unset=only_unset)
+        if row is None:
+            if review is not None:
+                review.append(review_row(L, fallback_kind, fallback_why))
+            return
+        if review is not None:
+            review.append(row)
+        if loose is not None and row["kind"] == "loose_flagged":
+            loose.append(row)
+
     groups = defaultdict(list)
+    unset_best = {}
     for r in records:
         if not r["set_id"]:
-            if review is not None and newf(r):
-                review.append(review_row(r, "no_set", "its set could not be worked out from the listing"))
-            continue  # without a set, different printings could be mixed up
+            if newf(r):  # keep the cheapest listing per store and card, then compare it by name
+                k = (r["store"], r["name_key"], r["foil"], r["finishes"], r["frames"], r["number"])
+                if k not in unset_best or r["price"] < unset_best[k]["price"]:
+                    unset_best[k] = r
+            continue
         groups[(r["name_key"], r["set_id"], r["foil"], r["finishes"])].append(r)
 
     spreads, cheaps = [], []
@@ -854,10 +942,10 @@ def analyse(records, book, now=None, days=None, review=None):
         for sub in list(subs.values()) + loose_groups:
             best = best_per_store(sub)  # cheapest in-stock listing at each store
             if len(best) < 2:
-                if review is not None:
-                    for r in best.values():
-                        if newf(r):
-                            review.append(review_row(r, "alone", "no other store has this exact card in stock"))
+                for r in best.values():
+                    if newf(r):
+                        # nobody else has this exact printing, but another store may list it with no set
+                        run_loose(r, True, "alone", "no other store has this exact card in stock")
                 continue
             ranked = sorted(best.values(), key=lambda r: r["price"])
             flags = [newf(r) for r in ranked]
@@ -889,8 +977,14 @@ def analyse(records, book, now=None, days=None, review=None):
                 if gap >= need and (med - lo) >= MIN_CHEAP_SAVING:
                     cheaps.append({**row, "median_others": med, "gap": gap, "saving": med - lo,
                                    "n_others": len(others)})
+
+    for L in unset_best.values():
+        run_loose(L, False, "noset_alone",
+                  "set unknown and no other store has a card with this name, finish and treatment")
     spreads.sort(key=lambda r: r["spread"], reverse=True)
     cheaps.sort(key=lambda r: r["saving"], reverse=True)
+    if loose is not None:
+        loose.sort(key=lambda r: r["saving"], reverse=True)
     return spreads, cheaps
 
 
@@ -938,8 +1032,8 @@ def store_summary(stats):
             if any("time budget" in e for e in s["errors"]):
                 problems.append(f"{name}: stopped early because the time budget ran out")
             if s["with_set"] < 0.5 * s["kept"]:
-                problems.append(f"{name}: a set could be worked out for under half of its listings, "
-                                f"so few cards can be compared")
+                problems.append(f"{name}: a set could be worked out for under half of its listings, so most of "
+                                f"its new cards are compared by name only and need a manual set check")
             if NEW_WITHIN_DAYS > 0:
                 newest = s.get("newest")
                 if newest is not None and newest < datetime.now(timezone.utc) - timedelta(days=STALE_NEWEST_DAYS):
@@ -973,7 +1067,8 @@ def prices_cell(entries):
     return "<br>".join(out)
 
 
-def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, review=None):
+def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, review=None, loose=None,
+               noset_samples=None):
     now = now or datetime.now(timezone.utc)
     days = NEW_WITHIN_DAYS
     working, total, problems = store_summary(stats)
@@ -1019,6 +1114,43 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
     else:
         parts.append("<p>None today.</p>")
 
+    if loose is not None:
+        parts.append("<h3>Possible discounts where the set is unknown (check the set by hand)</h3>")
+        parts.append("<p>These new listings could not be matched to an exact set. They were compared by card name, "
+                     "foil type, finish, treatment and collector number (when both show one) against the same card "
+                     "in other stores. The set is unknown, so each one is judged against every set it could be and "
+                     "flagged if it would be a discount for at least one of them. Before buying, open the listing "
+                     "and confirm which printing it is. The 'Sets it could be' column shows what each possible set "
+                     "costs elsewhere.</p>")
+        if loose:
+            parts.append(tbl + "<tr><th>Card</th><th>New listing</th><th>Best match</th><th>Saving</th>"
+                         "<th>Sets it could be (median price, stores)</th><th>Compare</th></tr>")
+            for x in loose[:MAX_ROWS]:
+                plural = "" if x["n_others"] == 1 else "s"
+                shown = x["set"] if x["known"] else "set unknown"
+                sets_txt = "<br>".join(f"{escape(l)}: {money(m)} ({n})" for l, m, n in x["sets"])
+                if x["n_sets"] > len(x["sets"]):
+                    sets_txt += f"<br>and {x['n_sets'] - len(x['sets'])} more"
+                weak = ""
+                if x["n_others"] == 1:
+                    weak = '<br><span style="color:#b00">only one other store</span>'
+                who = ("The other store's listing has no set." if x["known"]
+                       else "This listing has no set.")
+                parts.append(
+                    f"<tr><td>{card_cell(x)}<br><span style=\"color:#666\">{escape(x['finish'])}</span></td>"
+                    f"<td><a href=\"{escape(x['url'])}\">{money(x['price'])}</a><br>{escape(x['store'])}"
+                    f"<br>{escape(shown)}<br>added {fmt_added(x['added'])} ({fmt_age(x['added'], now)})</td>"
+                    f"<td>{escape(x['best_set'])}: {money(x['median'])}<br>({x['n_others']} other store{plural})"
+                    f"{weak}<br><span style=\"color:#666\">{who}</span></td>"
+                    f"<td>{money(x['saving'])} ({x['gap']:.0%})</td><td>{sets_txt}</td>"
+                    f"<td>" + "<br>".join(f"<a href=\"{escape(u)}\">{escape(s)}</a> {money(p)}"
+                                          for s, p, u in x["entries"][:5]) + "</td></tr>")
+            parts.append("</table>")
+            if len(loose) > MAX_ROWS:
+                parts.append(f"<p>Showing {MAX_ROWS} of {len(loose)}.</p>")
+        else:
+            parts.append("<p>None today.</p>")
+
     parts.append("<h3>Wide price spreads that involve a new listing</h3>")
     if spreads:
         parts.append(tbl + "<tr><th>Card</th><th>Set, finish</th><th>Lowest</th><th>Highest</th>"
@@ -1042,8 +1174,12 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
 
     if review is not None:
         parts.append("<h3>How each new listing was judged</h3>")
-        labels = [("flagged", "flagged (shown above)"), ("alone", "no other store has the exact card in stock"),
-                  ("no_set", "set could not be worked out"), ("ambiguous", "no collector number, several printings"),
+        labels = [("flagged", "flagged (shown in the first table)"),
+                  ("loose_flagged", "set unknown, possible discount (shown in the set-unknown table)"),
+                  ("loose_other", "set unknown, compared by name but not cheap enough"),
+                  ("noset_alone", "set unknown and no other store has a card with that name and finish"),
+                  ("alone", "no other store has the exact card in stock"),
+                  ("ambiguous", "no collector number, several printings"),
                   ("not_cheapest", "another store is cheaper"), ("gap", "gap below the threshold"),
                   ("saving", "saving below the dollar minimum")]
         counts = defaultdict(int)
@@ -1051,7 +1187,7 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
             counts[x["kind"]] += 1
         if review:
             parts.append("<ul>" + "".join(f"<li>{counts[k]}: {escape(t)}</li>" for k, t in labels if counts[k]) + "</ul>")
-            near = sorted([x for x in review if x["kind"] in ("not_cheapest", "gap", "saving")],
+            near = sorted([x for x in review if x["kind"] in ("not_cheapest", "gap", "saving", "loose_other")],
                           key=lambda x: x["gap"], reverse=True)
             if near:
                 parts.append("<p>Closest to being flagged (the gap is measured against the median of the other stores):</p>")
@@ -1089,6 +1225,8 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
 
     if samples is not None:
         parts.append("<h3>Parse samples (dry run only)</h3>")
+        parts.append("<p>The first few listings kept from each store, whatever their date. This only shows whether "
+                     "names, sets and numbers are being read correctly. It does not affect the results.</p>")
         parts.append(tbl + "<tr><th>Store</th><th>Listing title</th><th>Read as</th></tr>")
         for store, recs in samples.items():
             for r in recs:
@@ -1096,6 +1234,18 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
                         f"{finish_label(r['foil'], r['finishes'])}; frames: {', '.join(sorted(r['frames'])) or '-'}; "
                         f"cond: {r['cond']}; price: {money(r['price'])}; added: {fmt_added(r.get('added'))}")
                 parts.append(f"<tr><td>{escape(store)}</td><td>{escape(r['title'])}</td><td>{escape(read)}</td></tr>")
+        parts.append("</table>")
+    if samples is not None and noset_samples:
+        parts.append("<h3>Listings with no set (dry run only)</h3>")
+        parts.append("<p>Up to three per store, with every field the store gives that might hold the set. "
+                     "If you can see the set in one of these fields, tell me which and I can read it.</p>")
+        parts.append(tbl + "<tr><th>Store</th><th>Listing title</th><th>Vendor, type and tags</th>"
+                     "<th>SKU</th><th>Variant options</th></tr>")
+        for store, recs in noset_samples.items():
+            for r in recs:
+                parts.append(f"<tr><td>{escape(store)}</td><td>{escape(r['title'])}</td>"
+                             f"<td>{escape(' | '.join(r['loose'][:8]) or '-')}</td>"
+                             f"<td>{escape(r.get('sku') or '-')}</td><td>{escape(r.get('vtext') or '-')}</td></tr>")
         parts.append("</table>")
     return "\n".join(parts)
 
@@ -1172,9 +1322,14 @@ def main():
     book = SetBook()
     loaded, err = (load_scryfall_sets(book) if USE_SCRYFALL else (0, "turned off"))
     records, stats, samples = fetch_all(args.max_pages, book)
-    review = []
-    spreads, cheaps = analyse(records, book, now, review=review)
+    review, loose = [], []
+    spreads, cheaps = analyse(records, book, now, review=review, loose=loose)
     count_stats(records, stats, now, NEW_WITHIN_DAYS)
+
+    noset_samples = defaultdict(list)
+    for r in records:
+        if not r.get("set_id") and len(noset_samples[r["store"]]) < 3:
+            noset_samples[r["store"]].append(r)
 
     notes = [
         "Only in-stock, English, Near Mint listings are compared. If a store does not state a condition, NM is assumed.",
@@ -1188,20 +1343,24 @@ def main():
          "New column in the Store check table."),
         "Each new listing is compared with the cheapest in-stock price at every other store, new or old. "
         "A new listing that no other store carries cannot be judged, so it does not appear.",
+        "A new listing with no set is compared by card name, foil type, finish and treatment instead of being "
+        "skipped. It is judged against every set the card exists in, so some flags will be the wrong printing. "
+        "Treat the set-unknown table as a list to check by hand.",
         "Stores marked as whole-store feeds are read from their full product list and filtered to Magic cards "
         "using the Scryfall set list, so a missing set list means those stores return nothing.",
         "Prices are the cheapest in-stock listing per store, in AUD, and do not include shipping. "
         "For cards under about $15, shipping can cancel out the saving.",
-        "Two listings count as the same card only when name, set, foil type, treatment and collector number agree. "
-        "A card with no set information is skipped rather than guessed.",
+        "Two listings count as the same card only when name, set, foil type, treatment and collector number agree, "
+        "except for the set-unknown comparison described above.",
         (f"Set names loaded from Scryfall: {loaded}." if loaded
          else f"Scryfall set list not loaded ({err}). Set matching relied on codes shown in listing titles."),
     ]
     working, total, _ = store_summary(stats)
     new_total = sum(s["new"] for s in stats.values())
-    html = build_html(spreads, cheaps, stats, notes, book, samples if args.dry_run else None, now, review)
-    subject = (f"MTG new singles: {len(cheaps)} cheap new listing(s), {len(spreads)} spread(s), "
-               f"{new_total} new scanned, {working}/{total} stores OK")
+    html = build_html(spreads, cheaps, stats, notes, book, samples if args.dry_run else None, now, review, loose,
+                      noset_samples if args.dry_run else None)
+    subject = (f"MTG new singles: {len(cheaps)} cheap new listing(s), {len(loose)} set-unknown to check, "
+               f"{len(spreads)} spread(s), {new_total} new scanned, {working}/{total} stores OK")
     if args.dry_run:
         with open("report.html", "w", encoding="utf-8") as f:
             f.write(html)
