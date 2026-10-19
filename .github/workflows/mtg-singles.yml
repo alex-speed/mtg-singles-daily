@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
       new_days:
-        description: "Listings added in the last N days count as new (use 7 or more for a first test)"
+        description: "Window in days, measured back from each store's newest listing (use 7 or more for a first test)"
         type: string
         default: "2"
 
