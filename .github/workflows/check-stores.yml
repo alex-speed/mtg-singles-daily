@@ -1,0 +1,71 @@
+# Check stores: tests the stores file and helps you add stores without touching the bot's code.
+#
+# It runs by itself whenever you save a change to a stores-*.txt file, and shows in the Actions
+# tab within a minute: green means the file reads cleanly, and the run summary lists every store
+# and whether it could be read from GitHub.
+#
+# You can also run it by hand (Actions, Check stores, Run workflow) to:
+#   - find the Magic collections for a new store: type its website address in the first box
+#   - print the stores written inside the bot script as a stores file: tick the second box
+#
+# Safe to run in production? Yes. It only reads public web pages (one request per second per store)
+# and changes nothing in your tenant or on any server. Use a personal repository for it.
+
+name: Check stores
+
+on:
+  push:
+    paths:
+      - "stores-*.txt"
+      - "store_config.py"
+  workflow_dispatch:
+    inputs:
+      site:
+        description: "Find a store's Magic collections: type its website, for example https://example.com.au"
+        type: string
+        default: ""
+      export:
+        description: "Print the stores written inside the bot script as a stores file (use once when switching over)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v7
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install the packages the bots use
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Find a store's Magic collections
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.site != '' }}
+        env:
+          SITE: ${{ inputs.site }}
+        run: |
+          if [ -f mtg_singles_bot.py ]; then kind=singles; else kind=sealed; fi
+          python store_config.py discover "$SITE" --kind "$kind"
+
+      - name: Print the stores written inside the bot script
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.export }}
+        run: |
+          for pair in "mtg_deal_bot.py:sealed" "mtg_singles_bot.py:singles"; do
+            script="${pair%%:*}"
+            kind="${pair##*:}"
+            if [ -f "$script" ]; then
+              python store_config.py export "$script" --kind "$kind"
+            fi
+          done
+
+      - name: Check the stores file and test every store
+        run: python store_config.py check
