@@ -44,3 +44,10 @@ Jenes MTG | https://jenesmtg.com.au | *
 ManaCat | https://manacat.com.au | *
 Gumnut TCG | https://tcg.gumnut.com.au | *
 That Game Store | https://thatgamestore.com.au | *
+Guf | https://guf.com.au | mtg-singles-instock-all-stores 
+Spellroo Gaming | https://spellroogaming.com.au | magic-the-gathering-singles 
+88 Games Arena | https://www.88gamesarena.com.au | mtg-singles-australia-88-games-arena 
+Shuffle n Cut | https://shuffleandcutgames.com | mtg-singles 
+From The Deep Games | https://fromthedeepgames.com.au | mtg-singles-instock 
+Mega Games Penrith | https://www.megagames.com.au | mtg-singles 
+Elemental Arcade | https://elementalarcade.com.au | magic-the-gathering-tcg-singles
