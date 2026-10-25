@@ -52,7 +52,7 @@ jobs:
 
       # Scheduled runs, and manual runs with dry_run unticked, send the email.
       - name: Run bot and send email
-        if: ${{ github.event_name == 'schedule' || !inputs.dry_run }}
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
         env:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
@@ -69,7 +69,7 @@ jobs:
 
       # Manual runs with dry_run ticked build report.html and attach it to the run.
       - name: Run bot (dry run)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        if: ${{ github.event_name == 'schedule' || inputs.dry_run }}
         run: python mtg_singles_bot.py --dry-run --new-days ${{ inputs.new_days || '2' }} ${{ inputs.quick && '--max-pages 2' || '' }}
 
       - name: Attach the dry-run report
