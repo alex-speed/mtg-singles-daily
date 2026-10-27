@@ -1,12 +1,20 @@
-# MTG singles bot: runs once a day and emails new listings (added in the last 2 days) that are
-# priced well below other stores.
+# MTG singles bot: new listings (each store's latest batch) priced well below other stores.
 #
-# Safe to run in production? Yes. It only reads public web pages, makes one request to
-# Scryfall for set names, and sends one email. It changes nothing in your tenant or on any
-# server. Use a personal repository for it.
+# Scheduled runs are DRY RUNS: they build the report, attach it to the run, publish it to GitHub
+# Pages (built by build_site.py) and send no email. The web pages are kept in the docs folder, which
+# this workflow commits back to the repository after each scheduled run.
 #
-# Uses the same email secrets as the sealed-product bot (MAIL_TO, MAIL_FROM, and either the
-# GRAPH_* secrets or the SMTP_* secrets), so there is nothing new to set up.
+# Manual runs build the report and attach it. A manual dry run with "quick" unticked also publishes the
+# page. A quick run reads only 2 pages per store, so it never publishes.
+# To get the report by email, run this workflow by hand and untick "dry run".
+#
+# Safe to run in production? Yes. It only reads public web pages, makes one request to Scryfall for set
+# names, and sends one email only when you untick dry run by hand. It changes nothing in your tenant or
+# on any server, and the only files it writes to the repository are in the docs folder. Use a personal
+# repository for it.
+#
+# Uses the same email secrets as the sealed-product bot (MAIL_TO, MAIL_FROM, and either the GRAPH_*
+# secrets or the SMTP_* secrets).
 
 name: MTG singles
 
@@ -23,7 +31,7 @@ on:
         type: boolean
         default: true
       quick:
-        description: "Quick test: read only 2 pages per store (about 500 listings each)"
+        description: "Quick test: read only 2 pages per store (about 500 listings each). A quick run never publishes the page."
         type: boolean
         default: true
       new_days:
@@ -31,8 +39,14 @@ on:
         type: string
         default: "2"
 
+# Needed so the run can save the docs folder.
 permissions:
-  contents: read
+  contents: write
+
+# Never run two copies at once, because both would write the docs folder.
+concurrency:
+  group: mtg-singles
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -50,7 +64,7 @@ jobs:
       - name: Install requests
         run: pip install requests
 
-      # Scheduled runs, and manual runs with dry_run unticked, send the email.
+      # Only a manual run with dry run unticked sends an email.
       - name: Run bot and send email
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
         env:
@@ -67,14 +81,39 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: python mtg_singles_bot.py --new-days ${{ inputs.new_days || '2' }} ${{ inputs.quick && '--max-pages 2' || '' }}
 
-      # Manual runs with dry_run ticked build report.html and attach it to the run.
+      # Scheduled runs, and manual runs with dry run ticked, build report.html and attach it to the run.
+      # A scheduled run has no inputs, so it reads every page with the 2 day window.
       - name: Run bot (dry run)
         if: ${{ github.event_name == 'schedule' || inputs.dry_run }}
         run: python mtg_singles_bot.py --dry-run --new-days ${{ inputs.new_days || '2' }} ${{ inputs.quick && '--max-pages 2' || '' }}
 
-      - name: Attach the dry-run report
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      - name: Attach the report
+        if: ${{ github.event_name == 'schedule' || inputs.dry_run }}
         uses: actions/upload-artifact@v7
         with:
           name: singles-report
           path: report.html
+          retention-days: 14
+
+      # Builds the styled web pages with build_site.py, then saves them.
+      # It runs only after the bot finished without an error.
+      - name: Publish report
+        if: ${{ github.event_name == 'schedule' || (inputs.dry_run && !inputs.quick) }}
+        env:
+          SITE_TITLE: MTG singles
+          SITE_KICKER: Singles scan
+          SITE_CURRENT: Singles
+          SITE_NAV: "Sealed|https://alex-speed.github.io/mtg-deal-bot/;Singles|https://alex-speed.github.io/mtg-singles-daily/"
+        run: |
+          set -euo pipefail
+          python build_site.py
+          [ -d docs ] && git add docs || true
+          if git diff --cached --quiet; then
+            echo "Nothing new to save"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update report"
+          git pull --rebase
+          git push
