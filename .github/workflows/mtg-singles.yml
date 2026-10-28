@@ -4,6 +4,8 @@
 # Pages (built by build_site.py) and send no email. The web pages are kept in the docs folder, which
 # this workflow commits back to the repository after each scheduled run.
 #
+# The Re-scan button on the published page starts this workflow with "dry run" ticked and "quick" unticked.
+#
 # Manual runs build the report and attach it. A manual dry run with "quick" unticked also publishes the
 # page. A quick run reads only 2 pages per store, so it never publishes.
 # To get the report by email, run this workflow by hand and untick "dry run".
@@ -97,6 +99,8 @@ jobs:
 
       # Builds the styled web pages with build_site.py, then saves them.
       # It runs only after the bot finished without an error.
+      # The RESCAN_ settings switch on the Re-scan button on the page. RESCAN_INPUTS must match what
+      # makes this step run (dry run ticked and quick unticked).
       - name: Publish report
         if: ${{ github.event_name == 'schedule' || (inputs.dry_run && !inputs.quick) }}
         env:
@@ -104,6 +108,11 @@ jobs:
           SITE_KICKER: Singles scan
           SITE_CURRENT: Singles
           SITE_NAV: "Sealed|https://alex-speed.github.io/mtg-deal-bot/;Singles|https://alex-speed.github.io/mtg-singles-daily/"
+          RESCAN_REPO: ${{ github.repository }}
+          RESCAN_WORKFLOW: mtg-singles.yml
+          RESCAN_REF: ${{ github.ref_name }}
+          RESCAN_INPUTS: "dry_run=true,quick=false"
+          RESCAN_EXPECT: "540"
         run: |
           set -euo pipefail
           python build_site.py
