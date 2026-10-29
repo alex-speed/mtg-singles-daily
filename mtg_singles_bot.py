@@ -327,7 +327,7 @@ def load_scryfall_sets(book):
 # 4. Reading a listing title
 # ---------------------------------------------------------------------------
 
-_PREFIX_RE = re.compile(r"^\s*(?:magic\s*:?\s*the\s*gathering\s*[-:|]?\s*|(?:magic|mtg)\s*[-:|]\s+)", re.I)
+_PREFIX_RE = re.compile(r"^\s*(?:(?:magic|mtg)(?:\s*:?\s*the\s*gathering)?\s+singles?\s*[-:|]\s+|magic\s*:?\s*the\s*gathering\s*[-:|]?\s*|(?:magic|mtg)\s*[-:|]\s+)", re.I)
 _SUFFIX_RE = re.compile(r"\s+[-|]\s*(?:magic\s*:?\s*the\s*gathering|mtg)\s*$", re.I)
 _FOIL_PREFIX_RE = re.compile(r"^\s*(?:\[\s*foil\s*\]|foil)\s+", re.I)
 _GROUP_RE = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]")
@@ -336,7 +336,7 @@ _SETNUM_RE = re.compile(r"^(" + _LETTER + r"[A-Za-z0-9]{2,6})\s*[-/#]\s*(\d+[A-Z
 _SETNUM_FIND_RE = re.compile(r"[\(\[]\s*(" + _LETTER + r"[A-Za-z0-9]{2,6})\s*[-/#]\s*(\d+[A-Za-z\u2605]*)\s*[\)\]]")
 _CODE_SPACE_NUM_RE = re.compile(r"^(" + _LETTER + r"[A-Z0-9]{2,6})\s+(\d{1,4}[A-Za-z\u2605]?)$")
 _TRAIL_CODE_SLASH_RE = re.compile(r"\s+(" + _LETTER + r"[A-Z0-9]{2,6})\s*/\s*(\d{1,4}[A-Za-z\u2605]?)\s*$")
-_RARITY_CODE_RE = re.compile(r"^(?:common|uncommon|rare|mythic(?:\s+rare)?|special|bonus)\s+([A-Za-z0-9]{2,6})$", re.I)
+_RARITY_CODE_RE = re.compile(r"^(?i:common|uncommon|rare|mythic(?:\s+rare)?|special|bonus)\s+((?=[A-Z0-9]*[A-Z])[A-Z0-9]{2,6})$")  # the code must be capitals, so "Special Guests" is not a code
 _HASHNUM_RE = re.compile(r"\s*#\s*(\d+[A-Za-z\u2605]*)\b")
 _TRAILNUM_RE = re.compile(r"\s+(\d{1,4}[A-Za-z\u2605]?)(?:\s*/\s*\d{1,4})?\s*$")
 _TRAILFOIL_RE = re.compile(r"\s+foil\s*$", re.I)
@@ -419,50 +419,131 @@ def scan_traits(text):
     return frames, finishes, foil, (matched and rest == "")
 
 
+# ---------------------------------------------------------------------------
+# Printing identity helpers (added by patch_identity_fixes.py)
+# ---------------------------------------------------------------------------
+# A bracketed word that no set explains (for example "Shattered Glass") keeps a listing out of the plain
+# printing's group, because it is probably a different printing. Set this to False to turn that off.
+STRICT_QUALIFIERS = True
+_EDITION_RES = {
+    "worldchamp": re.compile(r"\bworld\s+championships?\b|\bwcd\b|\bwc\s*\d{2}\b", re.I),
+    "goldborder": re.compile(r"\bgold[\s-]*border(?:ed)?\b", re.I),
+    "collectors": re.compile(r"\b(?:international\s+|intl\.?\s+)?collector[s\u2019']*\s+edition\b", re.I),
+}
+EDITION_LABELS = {"worldchamp": "World Championship", "goldborder": "Gold Border", "collectors": "Collectors' Edition"}
+_QUAL_NOISE_RE = re.compile(r"^(?:english|en|eng|nm|near mint|magic|mtg|regular|normal|standard|default|common|"
+                            r"uncommon|rare|mythic|mythic rare|special|bonus)$")
+_GENERIC_REMAINDER = {"token", "tokens", "emblem", "emblems", "card", "cards"}
+_OTHER_GAME_RE = re.compile(r"\b(?:pok[e\u00e9]mon|yu-?gi-?oh|lorcana|digimon|one\s+piece|dragon\s*ball|"
+                            r"flesh\s+and\s+blood|star\s+wars\s+unlimited)\b", re.I)
+_NONCARD_TYPE_RE = re.compile(r"\b(?:events?|tickets?|figures?|figurines?|toys?|plush|apparel|clothing|merch(?:andise)?|"
+                              r"gift\s*cards?|vouchers?|accessor(?:y|ies)|supplies|sleeves|playmats?|sealed)\b", re.I)
+_NONCARD_TAG_RE = re.compile(r"^(?:events?|event\s+tickets?|tickets?|figures?|action\s+figures?|toys?|plush|apparel|"
+                             r"merch(?:andise)?|gift\s*cards?|accessories|supplies)$", re.I)
+_NONCARD_TITLE_RE = re.compile(r"\b(?:event\s+tickets?|entry\s+tickets?|gift\s+cards?|action\s+figures?|figurines?|"
+                               r"t-?shirts?|hoodies?)\b|\bticket\s*$", re.I)
+_SINGLE_META_RE = re.compile(r"\b(?:singles?|cards?)\b", re.I)
+_VAR_CODE_NUM_RE = re.compile(r"^([A-Za-z0-9]{2,6})\s+(\d{1,4}[A-Za-z\u2605]?)(?:\s+(?:non[\s-]*)?foil)?$", re.I)
+def edition_keys(text):
+    """Special editions named in a text: World Championship, Gold Border, Collectors' Edition."""
+    return {k for k, rx in _EDITION_RES.items() if rx.search(unescape(text or ""))}
+def _is_meta_text(t):
+    """True if the text holds only finish, treatment, foil, condition, number or code words, and names no set."""
+    t = (t or "").strip(" :,-")
+    if not t:
+        return True
+    if t.isdigit() or _SETNUM_RE.match(t) or _CODE_SPACE_NUM_RE.match(t) or _RARITY_CODE_RE.match(t):
+        return True
+    c = cond_from_text(t) if len(t) <= 20 else None
+    if c and re.fullmatch(r"[A-Za-z/\-\s]+", t) and len(t.split()) <= 3:
+        return True
+    return bool(scan_traits(t)[3])
+def not_a_single(p, title, ptype, tags):
+    """True if the product's own details say it is not a single Magic card (a ticket, figure, other game...)."""
+    meta = " ".join([ptype] + [str(t) for t in tags])
+    if _OTHER_GAME_RE.search(f"{title} {p.get('vendor', '') or ''} {meta}"):
+        return True
+    if "single" not in ptype.lower() and _NONCARD_TYPE_RE.search(ptype):
+        return True
+    if any(_NONCARD_TAG_RE.match(str(t).strip()) for t in tags):
+        return True
+    return bool(_NONCARD_TITLE_RE.search(title))
+def variant_identity(v, book):
+    """Reads a set code and collector number ("MOC 120", "VOW 164 Foil") or a full set name out of a variant's
+    options. Only sets the Scryfall list knows are accepted, so nothing is guessed. Returns (code, number)."""
+    if book is None or not book.name_by_code:
+        return None, None
+    code, number = None, None
+    for part in (v.get("title"), v.get("option1"), v.get("option2"), v.get("option3")):
+        for piece in re.split(r"\s+/\s+", (part or "").strip()):
+            piece = piece.strip()
+            if not piece or piece.lower() == "default title":
+                continue
+            m = _VAR_CODE_NUM_RE.match(piece)
+            if m and m.group(1).lower() in book.name_by_code:
+                code = code or m.group(1).lower()
+                number = number or norm_num(m.group(2))
+                continue
+            if len(piece) >= 4 and not cond_from_text(piece):
+                found = book.lookup_name(piece)
+                if found:
+                    code = code or found
+    return code, number
 def clean_name(s):
     return re.sub(r"\s+", " ", s).strip(" -:,|")
 
 
-def strip_set_prefix(name, loose_texts):
-    """If the title starts with the set name given in vendor or tags, drop that prefix."""
+def strip_set_prefix(name, loose_texts, book=None):
+    """If the title starts with the set name given in vendor or tags, drop that prefix.
+    Only a set the Scryfall list confirms is removed, so a tag such as 'Knight' can no longer turn
+    'Knight Token' into 'Token'. With no set list loaded nothing is removed."""
+    if book is None or not book.name_by_code:
+        return name
     words = name.split()
     for text in loose_texts:
         target = norm_set(text)
-        if not target:
+        if not target or not (book.lookup_name(text) or book.lookup_code(text)):
             continue
         for k in range(1, len(words)):
             if norm_set(" ".join(words[:k])) == target:
-                return " ".join(words[k:])
+                rest = " ".join(words[k:])
+                return name if norm(rest) in _GENERIC_REMAINDER else rest
     return name
-
-
 def _group_texts(chunk):
     return [a or b for a, b in _GROUP_RE.findall(chunk)]
 
 
-def parse_title(title, loose_texts=()):
+def parse_title(title, loose_texts=(), book=None):
     """
     Splits a listing title into card name, set clues, collector number, foil and treatments.
     Handles these shapes (and combinations of them):
       Name (Borderless) (SET-123) - Set Name          code and number in brackets
       Name (Borderless) [SET - 123]                   same, with spaces
       Name (Showcase) [Set Name]                      set in square brackets
+      Name [Foil] - Set Name                          brackets that hold only foil or treatment words
+      Name [Set Name] - Foil                          a finish after the set
       Name - SET 123 Foil                             code and number after a dash
       Name SET/123                                    code and number joined by a slash
       Name (SET #123)                                 hash number
       Name 123 (Set Name) - Foil                      number after the name
+      Name | Set Name | 6                             pipe layout
+      Magic Single - Name                             store prefix
     """
-    s = unescape(title or "").strip()
-    s = _PREFIX_RE.sub("", s, count=1)
+    raw_title = unescape(title or "").strip()
+    s = _PREFIX_RE.sub("", raw_title, count=1)
     s = _SUFFIX_RE.sub("", s)
+    if " | " in s:  # "Name | Set | 6": rewrite it into the dash layout that is read below
+        pieces = [x.strip() for x in s.split(" | ") if x.strip()]
+        if 2 <= len(pieces) <= 4 and not _GROUP_RE.search(pieces[0]):
+            nums = [x for x in pieces[1:] if re.fullmatch(r"\d{1,4}[A-Za-z\u2605]?", x)]
+            rest = [x for x in pieces[1:] if x not in nums]
+            s = pieces[0] + (f" #{nums[0]}" if nums else "") + "".join(f" - {x}" for x in rest)
     foil, cond = None, None
-    frames, finishes, set_texts, bare_nums = set(), set(), [], []
+    frames, finishes, set_texts, bare_nums, group_texts = set(), set(), [], [], []
     set_code, number = None, None
-
     m = _FOIL_PREFIX_RE.match(s)
     if m:
         foil, s = True, s[m.end():]
-
     def handle_text(text, is_group):
         nonlocal foil, cond, set_code, number
         t = text.strip(" :,-")
@@ -502,8 +583,10 @@ def parse_title(title, loose_texts=()):
             set_code = set_code or m3.group(1).lower()
             number = number or norm_num(m3.group(2))
             return
-        set_texts.append(clean_name(t))
-
+        cleaned = clean_name(t)
+        set_texts.append(cleaned)
+        if is_group:
+            group_texts.append(cleaned)
     mc = _SETNUM_FIND_RE.search(s)
     if mc:
         # A code and number in brackets marks the end of the name, so a dash inside the name is kept.
@@ -519,9 +602,16 @@ def parse_title(title, loose_texts=()):
         for g in _group_texts(s):
             handle_text(g, True)
         s2 = _GROUP_RE.sub(" ", s)
-        if re.search(r"\[[^\[\]]+\]", s):
-            # The set is in square brackets, so any dash left in the title belongs to the card name.
-            name_part, extra_parts = s2, []
+        if any(not _is_meta_text(b) for b in re.findall(r"\[([^\[\]]+)\]", s)):
+            # The set is in square brackets, so a dash left in the title may belong to the card name.
+            # A trailing "- Foil" style part is still a finish, not part of the name.
+            parts = [p for p in re.split(r"\s+-\s+", s2) if p.strip()]
+            if not parts:
+                return None
+            trailing = []
+            while len(parts) > 1 and _is_meta_text(parts[-1]):
+                trailing.insert(0, parts.pop())
+            name_part, extra_parts = " - ".join(parts), trailing
         else:
             parts = [p for p in re.split(r"\s+-\s+", s2) if p.strip()]
             if not parts:
@@ -531,7 +621,6 @@ def parse_title(title, loose_texts=()):
         return None
     for p in extra_parts:
         handle_text(p, False)
-
     ms = _TRAIL_CODE_SLASH_RE.search(name_part)
     if ms and not set_code:
         set_code, number = ms.group(1).lower(), norm_num(ms.group(2))
@@ -546,16 +635,14 @@ def parse_title(title, loose_texts=()):
         name_part = name_part[:mt.start()]
     if not number and bare_nums:
         number = norm_num(bare_nums[0])
-
-    name = clean_name(strip_set_prefix(clean_name(name_part), loose_texts))
+    name = clean_name(strip_set_prefix(clean_name(name_part), loose_texts, book))
     front = name.split("//")[0].strip()
     if len(norm(front)) < 2:
         return None
     return {"name": front, "name_key": norm(front), "set_code": set_code, "set_texts": [t for t in set_texts if t],
+            "group_texts": group_texts, "edition": frozenset(edition_keys(raw_title)),
             "number": number, "foil": foil, "frames": frozenset(frames), "finishes": frozenset(finishes),
             "cond_title": cond}
-
-
 def loose_candidates(vendor, ptype, tags):
     out = []
     for raw in [vendor, ptype] + list(tags or []):
@@ -577,7 +664,7 @@ def variant_text(v):
 
 def new_stat():
     return {"pages": 0, "ok": 0, "tried": 0, "products": 0, "variants": 0, "in_stock": 0, "junk": 0,
-            "unparsed": 0, "foreign": 0, "not_nm": 0, "nonmtg": 0, "kept": 0, "with_set": 0,
+            "unparsed": 0, "foreign": 0, "not_nm": 0, "nonmtg": 0, "nonsingle": 0, "kept": 0, "with_set": 0,
             "with_number": 0, "dated": 0, "new": 0, "newest": None, "truncated": False, "errors": []}
 
 
@@ -585,20 +672,25 @@ _MTG_WORD_RE = re.compile(r"\b(?:magic|mtg)\b", re.I)
 
 
 def looks_like_mtg(p, parsed, tags, loose, book):
-    """Used for whole-store feeds, which also hold Pokemon, accessories and other games."""
-    text = " ".join([p.get("title", "") or "", p.get("vendor", "") or "", p.get("product_type", "") or ""]
-                    + [str(t) for t in tags])
+    """Used for whole-store feeds, which also hold Pokemon, accessories and other games.
+    A listing is accepted only with positive Magic evidence, and never when it names another game."""
+    ptype = p.get("product_type", "") or ""
+    meta = " ".join([p.get("vendor", "") or "", ptype] + [str(t) for t in tags])
+    text = " ".join([p.get("title", "") or "", meta])
+    if _OTHER_GAME_RE.search(text):
+        return False
     if _MTG_WORD_RE.search(text):
         return True
-    if book is not None and book.name_by_code:
-        if parsed["set_code"] and parsed["set_code"].lower() in book.name_by_code:
-            return True
-        for t in list(parsed["set_texts"]) + list(loose):
-            if book.lookup_name(t) or book.lookup_code(t):
-                return True
-    return False
-
-
+    if book is None or not book.name_by_code:
+        return False
+    code_ok = bool(parsed["set_code"] and parsed["set_code"].lower() in book.name_by_code)
+    text_ok = any(book.lookup_name(t) or book.lookup_code(t) for t in list(parsed["set_texts"]) + list(loose))
+    # Set evidence alone is not enough, because set codes are shared with other games. It must come with a
+    # collector number or with the store calling the product a single or a card.
+    single_word = bool(_SINGLE_META_RE.search(" ".join([ptype] + [str(t) for t in tags])))
+    if code_ok and parsed["number"]:
+        return True
+    return bool((code_ok or text_ok) and single_word)
 def records_from_product(store, base, p, st, samples, need_mtg=False, book=None):
     st["products"] += 1
     title = p.get("title", "") or ""
@@ -609,14 +701,18 @@ def records_from_product(store, base, p, st, samples, need_mtg=False, book=None)
     tags = p.get("tags", [])
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]
+    if not_a_single(p, title, ptype, tags):
+        st["nonsingle"] = st.get("nonsingle", 0) + 1
+        return []
     loose = loose_candidates(p.get("vendor", ""), ptype, tags)
-    parsed = parse_title(title, loose)
+    parsed = parse_title(title, loose, book)
     if not parsed:
         st["unparsed"] += 1
         return []
     if need_mtg and not looks_like_mtg(p, parsed, tags, loose, book):
         st["nonmtg"] += 1
         return []
+    loose_edition = frozenset(edition_keys(" ".join(loose)))
     out = []
     variants = p.get("variants", [])
     for v in variants:
@@ -638,14 +734,22 @@ def records_from_product(store, base, p, st, samples, need_mtg=False, book=None)
         if cond not in COMPARE_CONDITIONS:
             st["not_nm"] += 1
             continue
+        # finishes and treatments can be written in the variant instead of the title ("NM / Etched Foil")
+        v_frames, v_finishes, _vfoil, _pure = scan_traits(vtext)
+        finishes = parsed["finishes"] | frozenset(v_finishes)
+        frames = parsed["frames"] | frozenset(v_frames)
         if _NONFOIL_RE.search(vtext):
             foil = False
         elif _FOIL_RE.search(vtext):
             foil = True
         else:
             foil = bool(parsed["foil"])
-        if parsed["finishes"]:
+        if finishes:
             foil = True
+        v_code, v_number = variant_identity(v, book)
+        number = parsed["number"] or v_number
+        num_conflict = bool(parsed["number"] and v_number and parsed["number"] != v_number)
+        edition = parsed["edition"] | loose_edition | frozenset(edition_keys(vtext))
         url = f"{base}/products/{p.get('handle', '')}"
         if len(variants) > 1 and v.get("id"):
             url += f"?variant={v['id']}"
@@ -653,8 +757,9 @@ def records_from_product(store, base, p, st, samples, need_mtg=False, book=None)
         rec = {"store": store, "title": title, "url": url, "price": price, "foil": foil, "cond": cond,
                "added": added,
                "name": parsed["name"], "name_key": parsed["name_key"], "set_code": parsed["set_code"],
-               "set_texts": parsed["set_texts"], "loose": loose, "number": parsed["number"],
-               "frames": parsed["frames"], "finishes": parsed["finishes"],
+               "set_texts": parsed["set_texts"], "group_texts": parsed["group_texts"], "loose": loose,
+               "number": number, "frames": frames, "finishes": finishes,
+               "edition": edition, "vset": v_code, "num_conflict": num_conflict,
                "sku": v.get("sku") or "", "vtext": vtext,
                "uid": (store, p.get("handle", ""), v.get("id"))}
         out.append(rec)
@@ -662,8 +767,6 @@ def records_from_product(store, base, p, st, samples, need_mtg=False, book=None)
         if len(samples[store]) < 4:
             samples[store].append(rec)
     return out
-
-
 def read_store(entry, cap, book):
     """Reads one store. Returns (store name, records, stat, samples). Safe to run in a worker thread."""
     name, base, handles, *rest = entry
@@ -744,36 +847,87 @@ def fetch_all(max_pages=None, book=None, workers=None):
 # ---------------------------------------------------------------------------
 
 
-def resolve_set(rec, book):
-    if rec["set_code"]:
-        return rec["set_code"].lower()
+def resolve_identity(rec, book):
+    """Works out which printing a listing is. Returns (set id, status, qualifiers).
+    status is
+      verified     a set the Scryfall list knows
+      unverified   a set code that nothing could confirm
+      text         set words that match no known set (kept as a label only, never counted as a verified set)
+      conflicting  the clues name different sets, or the title and variant give different collector numbers
+      unknown      no clue at all
+    A conflicting or unknown listing gets the id "" so it is never compared as an exact match.
+    A special edition (World Championship, Gold Border, Collectors' Edition) is part of the id, so it never joins
+    the ordinary set's group. qualifiers are bracketed words that no set explains."""
+    edition = rec.get("edition") or frozenset()
+    known = book.name_by_code
+    cands = []
+    def consider(code):
+        code = (code or "").lower()
+        if code and code in known and code not in cands:
+            cands.append(code)
+    consider(rec["set_code"])
+    consider(rec.get("vset"))
     for t in rec["set_texts"]:
-        code = book.lookup_name(t) or book.lookup_code(t)
-        if code:
-            return code
-    if rec["set_texts"]:
-        return "name:" + norm_set(rec["set_texts"][0])
-    for t in rec["loose"]:
-        code = book.lookup_name(t) or book.lookup_code(t)
-        if code:
-            return code
-    return ""
-
-
+        consider(book.lookup_name(t) or book.lookup_code(t))
+    if edition:  # a code that is itself the special edition set wins over a reference to the original set
+        own = [c for c in cands if edition_keys(known.get(c, "")) & edition]
+        if own:
+            cands = own[:1]
+    if rec.get("num_conflict") or len(cands) > 1:
+        return "", "conflicting", frozenset()
+    code = (rec["set_code"] or "").lower()
+    if cands:
+        sid, status = cands[0], "verified"
+    elif code:
+        sid, status = code, "unverified"
+    elif rec["set_texts"]:
+        sid, status = "name:" + norm_set(rec["set_texts"][0]), "text"
+    else:
+        sid, status = "", "unknown"
+        for t in rec["loose"]:
+            c = book.lookup_name(t) or book.lookup_code(t)
+            if c:
+                sid, status = c, "verified"
+                break
+    if sid and edition:
+        own_name = known.get(sid, "") if status == "verified" else ""
+        extra = edition - edition_keys(own_name)
+        if extra:
+            sid = sid + "~" + "+".join(sorted(extra))
+    qual = set()
+    if STRICT_QUALIFIERS and status in ("verified", "unverified"):
+        for t in rec.get("group_texts", []):
+            key = norm_set(t)
+            if (not key or len(key) < 2 or _QUAL_NOISE_RE.match(key) or edition_keys(t)
+                    or book.lookup_name(t) or book.lookup_code(t)):
+                continue
+            qual.add(key)
+    return sid, status, frozenset(qual)
+def resolve_set(rec, book):
+    return resolve_identity(rec, book)[0]
 def prepare(records, book):
+    had_catalogue = bool(book.name_by_code)
     for r in records:  # learn name-to-code pairs from titles that show both
-        if r["set_code"] and r["set_texts"]:
-            book.add(r["set_texts"][0], r["set_code"])
+        if not r["set_code"] or r.get("edition"):
+            continue
+        # Bracketed words may be a treatment, not a set, so only a dash-separated set name is learned. A name is
+        # never learned for a code the Scryfall list does not know, or for a name that already means another set.
+        texts = [t for t in r["set_texts"] if t not in r.get("group_texts", [])]
+        code = r["set_code"].lower()
+        if texts and (not had_catalogue or code in book.name_by_code) and book.lookup_name(texts[0]) in (None, code):
+            book.add(texts[0], code)
     for r in records:
-        r["set_id"] = resolve_set(r, book)
-
-
+        r["set_id"], r["id_status"], r["qual"] = resolve_identity(r, book)
+        r["set_verified"] = r["id_status"] == "verified"
 def set_label(set_id, rec, book):
-    if set_id.startswith("name:"):
-        return rec["set_texts"][0] if rec["set_texts"] else set_id[5:]
-    return book.name_by_code.get(set_id) or set_id.upper()
-
-
+    base, _, ed = set_id.partition("~")
+    if base.startswith("name:"):
+        label = rec["set_texts"][0] if rec["set_texts"] else base[5:]
+    else:
+        label = book.name_by_code.get(base) or base.upper()
+    if ed:
+        label += " (" + ", ".join(EDITION_LABELS.get(k, k) for k in ed.split("+")) + ")"
+    return label
 def finish_label(foil, finishes):
     if not foil:
         return "Non-foil"
@@ -822,9 +976,7 @@ def judge_new_listing(row, ranked, i):
 
 
 def card_key(r):
-    return (r["name_key"], r["foil"], r["finishes"])
-
-
+    return (r["name_key"], r["foil"], r["finishes"], r.get("edition", frozenset()), r.get("qual", frozenset()))
 def loose_compare(L, pool, book, only_unset=False):
     """
     Compares listing L with other stores' listings of the same card when the set cannot be matched
@@ -915,11 +1067,12 @@ def analyse(records, book, now=None, days=None, review=None, loose=None):
     for r in records:
         if not r["set_id"]:
             if newf(r):  # keep the cheapest listing per store and card, then compare it by name
-                k = (r["store"], r["name_key"], r["foil"], r["finishes"], r["frames"], r["number"])
+                k = (r["store"], r["name_key"], r["foil"], r["finishes"], r["frames"], r["number"],
+                     r.get("edition"), r.get("qual"))
                 if k not in unset_best or r["price"] < unset_best[k]["price"]:
                     unset_best[k] = r
             continue
-        groups[(r["name_key"], r["set_id"], r["foil"], r["finishes"])].append(r)
+        groups[(r["name_key"], r["set_id"], r["foil"], r["finishes"], r["qual"])].append(r)
 
     spreads, cheaps = [], []
     for key, recs in groups.items():
@@ -1005,7 +1158,7 @@ def count_stats(records, stats, now, days):
     newf = make_is_new(records, now, days)
     for r in records:
         st = stats[r["store"]]
-        if r.get("set_id"):
+        if r.get("set_verified"):
             st["with_set"] += 1
         if r["number"]:
             st["with_number"] += 1
@@ -1234,13 +1387,13 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
 
     parts.append("<h3>Store check</h3>")
     parts.append(tbl + "<tr><th>Store</th><th>Pages</th><th>Products</th><th>In-stock variants</th>"
-                 f"<th>Kept (NM, English)</th><th>With a set</th><th>With a number</th>"
+                 f"<th>Kept (NM, English)</th><th>Not a single card</th><th>With a verified set</th><th>With a number</th>"
                  f"<th>With an added date</th><th>{'Latest batch' if NEW_MODE == 'store' else 'New'} ({days}d)</th>"
                  f"<th>Newest listing</th></tr>")
     for name, s in stats.items():
         trunc = " (hit page limit)" if s["truncated"] else ""
         parts.append(f"<tr><td>{escape(name)}</td><td>{s['pages']}{trunc}</td><td>{s['products']}</td>"
-                     f"<td>{s['in_stock']}</td><td>{s['kept']}</td><td>{s['with_set']}</td>"
+                     f"<td>{s['in_stock']}</td><td>{s['kept']}</td><td>{s['junk'] + s.get('nonsingle', 0) + s['nonmtg']}</td><td>{s['with_set']}</td>"
                      f"<td>{s['with_number']}</td><td>{s['dated']}</td><td>{s['new']}</td>"
                      f"<td>{fmt_added(s.get('newest'))} ({fmt_age(s.get('newest'), now)})</td></tr>")
     parts.append("</table>")
@@ -1258,7 +1411,7 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
             for r in recs:
                 read = (f"name: {r['name']}; set: {r.get('set_id') or 'unknown'}; number: {r['number'] or '-'}; "
                         f"{finish_label(r['foil'], r['finishes'])}; frames: {', '.join(sorted(r['frames'])) or '-'}; "
-                        f"cond: {r['cond']}; price: {money(r['price'])}; added: {fmt_added(r.get('added'))}")
+                        f"cond: {r['cond']}; price: {money(r['price'])}; added: {fmt_added(r.get('added'))}; identity: {r.get('id_status') or '-'}")
                 parts.append(f"{row_open(r.get('added'), now)}<td>{escape(store)}</td><td>{escape(r['title'])}</td><td>{escape(read)}</td></tr>")
         parts.append("</table>")
     if samples is not None and noset_samples:
