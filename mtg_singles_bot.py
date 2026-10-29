@@ -108,6 +108,7 @@ MIN_CHEAP_GAP = 0.25         # 25% or more below the median of the other stores
 MIN_CHEAP_GAP_ONE_OTHER = 0.35  # a stricter gap when only one other store can be compared
 MIN_CHEAP_SAVING = 5.00      # and saves at least this many dollars against that median
 CHECK_PRINTING_RATIO = 4.0   # flag spreads this wide as "check it is the same printing"
+MAX_LISTING_AGE_DAYS = 5     # drop anything added more than this many days ago (Adelaide dates)
 MAX_ROWS = 40                # rows per table in the email
 COMPARE_CONDITIONS = {"NM"}  # only these conditions are compared
 
@@ -192,14 +193,23 @@ def make_is_new(records, now, days, mode=None):
     return check
 
 
-def fmt_age(dt, now=None):
+def age_days(dt, now=None):
+    """Whole calendar days (Adelaide dates) between the day a listing was added and today. None if no date."""
     if not dt:
-        return ""
+        return None
     now = now or datetime.now(timezone.utc)
-    d = int((now - dt).total_seconds() // 86400)
-    return "today" if d <= 0 else f"{d}d ago"
-
-
+    return max((now.astimezone(TZ).date() - dt.astimezone(TZ).date()).days, 0)
+def is_today(dt, now=None):
+    return age_days(dt, now) == 0
+def is_recent(dt, now=None):
+    """True if the listing was added within MAX_LISTING_AGE_DAYS days. 5d ago is kept, 6d ago is not."""
+    d = age_days(dt, now)
+    return d is not None and d <= MAX_LISTING_AGE_DAYS
+def fmt_age(dt, now=None):
+    d = age_days(dt, now)
+    if d is None:
+        return ""
+    return "today" if d == 0 else f"{d}d ago"
 def fmt_added(dt):
     return dt.astimezone(TZ).strftime("%a %d %b") if dt else "-"
 
@@ -962,6 +972,8 @@ def analyse(records, book, now=None, days=None, review=None, loose=None):
                 "entries": [(r["store"], r["price"], r["url"], f) for r, f in zip(ranked, flags)],
                 "lo": lo, "hi": hi, "ratio": hi / lo, "spread": hi - lo, "added": first.get("added"),
                 "cv": statistics.pstdev(prices) / statistics.mean(prices),
+                "new_added": max((r["added"] for r, f in zip(ranked, flags) if f and r.get("added")),
+                                 default=None),
             }
             if len(best) >= MIN_STORES_SPREAD and row["ratio"] >= MIN_SPREAD_RATIO and row["spread"] >= MIN_SPREAD_ABS:
                 spreads.append(row)
@@ -1010,6 +1022,19 @@ def count_stats(records, stats, now, days):
 # ---------------------------------------------------------------------------
 
 
+TODAY_BG = "#c8f7dc"
+def row_open(dt, now):
+    """Opens a table row. The row is highlighted when the listing was added today."""
+    return f'<tr style="background:{TODAY_BG}">' if is_today(dt, now) else "<tr>"
+def today_badge(dt, now):
+    if not is_today(dt, now):
+        return ""
+    return (' <span style="background:#1b8f4a;color:#fff;padding:1px 7px;border-radius:9px;'
+            'font-size:11px;font-weight:bold">TODAY</span>')
+def keep_recent(rows, now, key="added"):
+    """Returns (rows added within the limit, how many rows were left out)."""
+    kept = [r for r in rows if is_recent(r.get(key), now)]
+    return kept, len(rows) - len(kept)
 def money(x):
     return f"${x:,.2f}"
 
@@ -1068,7 +1093,7 @@ def prices_cell(entries):
 
 
 def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, review=None, loose=None,
-               noset_samples=None):
+               noset_samples=None, hidden=0):
     now = now or datetime.now(timezone.utc)
     days = NEW_WITHIN_DAYS
     working, total, problems = store_summary(stats)
@@ -1087,6 +1112,7 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
     else:
         parts = [f"<p>The new-listing restriction is turned off, so all {kept} in-stock English NM listings "
                  f"were compared. {working} of {total} stores were read on {when}.</p>"]
+    parts.append(f"<p>Only listings added in the last {MAX_LISTING_AGE_DAYS} days are shown ({hidden} older row(s) left out). Rows with a listing added today are highlighted.</p>")
     tbl = '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse;font-size:13px">'
 
     parts.append("<h3>New listings priced well below the other stores</h3>")
@@ -1104,8 +1130,8 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
                 weak = '<br><span style="color:#b00">only one other store</span>'
             plural = "" if r["n_others"] == 1 else "s"
             parts.append(
-                f"<tr><td>{card_cell(r)}</td><td>{escape(r['set'])}, {escape(r['finish'])}</td>"
-                f"<td>{money(r['lo'])}<br>{escape(first[0])}<br>added {fmt_added(r['added'])} ({fmt_age(r['added'], now)})</td>"
+                f"{row_open(r['added'], now)}<td>{card_cell(r)}</td><td>{escape(r['set'])}, {escape(r['finish'])}</td>"
+                f"<td>{money(r['lo'])}<br>{escape(first[0])}<br>added {fmt_added(r['added'])} ({fmt_age(r['added'], now)}){today_badge(r['added'], now)}</td>"
                 f"<td>{money(r['median_others'])}<br>({r['n_others']} other store{plural}){weak}</td>"
                 f"<td>{money(r['saving'])} ({r['gap']:.0%})</td><td>{prices_cell(r['entries'])}</td></tr>")
         parts.append("</table>")
@@ -1137,9 +1163,9 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
                 who = ("The other store's listing has no set." if x["known"]
                        else "This listing has no set.")
                 parts.append(
-                    f"<tr><td>{card_cell(x)}<br><span style=\"color:#666\">{escape(x['finish'])}</span></td>"
+                    f"{row_open(x['added'], now)}<td>{card_cell(x)}<br><span style=\"color:#666\">{escape(x['finish'])}</span></td>"
                     f"<td><a href=\"{escape(x['url'])}\">{money(x['price'])}</a><br>{escape(x['store'])}"
-                    f"<br>{escape(shown)}<br>added {fmt_added(x['added'])} ({fmt_age(x['added'], now)})</td>"
+                    f"<br>{escape(shown)}<br>added {fmt_added(x['added'])} ({fmt_age(x['added'], now)}){today_badge(x['added'], now)}</td>"
                     f"<td>{escape(x['best_set'])}: {money(x['median'])}<br>({x['n_others']} other store{plural})"
                     f"{weak}<br><span style=\"color:#666\">{who}</span></td>"
                     f"<td>{money(x['saving'])} ({x['gap']:.0%})</td><td>{sets_txt}</td>"
@@ -1160,7 +1186,7 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
             if r["ratio"] >= CHECK_PRINTING_RATIO:
                 flag = '<br><span style="color:#b00">check it is the same printing</span>'
             parts.append(
-                f"<tr><td>{card_cell(r)}{flag}</td><td>{escape(r['set'])}, {escape(r['finish'])}</td>"
+                f"{row_open(r['new_added'], now)}<td>{card_cell(r)}{flag}{today_badge(r['new_added'], now)}</td><td>{escape(r['set'])}, {escape(r['finish'])}</td>"
                 f"<td>{money(r['lo'])}</td><td>{money(r['hi'])}</td>"
                 f"<td>{money(r['spread'])} ({r['ratio']:.1f}x)</td><td>{r['cv']:.0%}</td>"
                 f"<td>{prices_cell(r['entries'])}</td></tr>")
@@ -1196,10 +1222,10 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
                 for x in near[:25]:
                     plural = "" if x["n_others"] == 1 else "s"
                     parts.append(
-                        f"<tr><td><a href=\"{escape(x['url'])}\">{escape(x['name'])}</a> "
+                        f"{row_open(x['added'], now)}<td><a href=\"{escape(x['url'])}\">{escape(x['name'])}</a> "
                         f"<span style=\"color:#666\">({escape(str(x['set']))}"
                         f"{', #' + escape(str(x['number'])) if x.get('number') else ''})</span></td>"
-                        f"<td>{money(x['price'])}<br>{escape(x['store'])}<br>added {fmt_added(x['added'])} ({fmt_age(x['added'], now)})</td>"
+                        f"<td>{money(x['price'])}<br>{escape(x['store'])}<br>added {fmt_added(x['added'])} ({fmt_age(x['added'], now)}){today_badge(x['added'], now)}</td>"
                         f"<td>{money(x['median'])}<br>({x['n_others']} other store{plural})</td>"
                         f"<td>{x['gap']:.0%}</td><td>{money(x['saving'])}</td><td>{escape(x['why'])}</td></tr>")
                 parts.append("</table>")
@@ -1223,9 +1249,9 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
         parts.append("<h3>Problems</h3><ul>" + "".join(f"<li>{escape(p)}</li>" for p in problems) + "</ul>")
     parts.append("<h3>Notes</h3><ul>" + "".join(f"<li>{escape(n)}</li>" for n in notes) + "</ul>")
 
-    if samples is not None:
+    if samples:
         parts.append("<h3>Parse samples (dry run only)</h3>")
-        parts.append("<p>The first few listings kept from each store, whatever their date. This only shows whether "
+        parts.append("<p>The first few listings kept from each store that were added recently. This only shows whether "
                      "names, sets and numbers are being read correctly. It does not affect the results.</p>")
         parts.append(tbl + "<tr><th>Store</th><th>Listing title</th><th>Read as</th></tr>")
         for store, recs in samples.items():
@@ -1233,7 +1259,7 @@ def build_html(spreads, cheaps, stats, notes, book, samples=None, now=None, revi
                 read = (f"name: {r['name']}; set: {r.get('set_id') or 'unknown'}; number: {r['number'] or '-'}; "
                         f"{finish_label(r['foil'], r['finishes'])}; frames: {', '.join(sorted(r['frames'])) or '-'}; "
                         f"cond: {r['cond']}; price: {money(r['price'])}; added: {fmt_added(r.get('added'))}")
-                parts.append(f"<tr><td>{escape(store)}</td><td>{escape(r['title'])}</td><td>{escape(read)}</td></tr>")
+                parts.append(f"{row_open(r.get('added'), now)}<td>{escape(store)}</td><td>{escape(r['title'])}</td><td>{escape(read)}</td></tr>")
         parts.append("</table>")
     if samples is not None and noset_samples:
         parts.append("<h3>Listings with no set (dry run only)</h3>")
@@ -1325,10 +1351,18 @@ def main():
     review, loose = [], []
     spreads, cheaps = analyse(records, book, now, review=review, loose=loose)
     count_stats(records, stats, now, NEW_WITHIN_DAYS)
+    # Only listings added in the last MAX_LISTING_AGE_DAYS days are shown (Adelaide dates).
+    cheaps, h_cheap = keep_recent(cheaps, now)
+    loose, h_loose = keep_recent(loose, now)
+    spreads, h_spread = keep_recent(spreads, now, "new_added")
+    review, _ = keep_recent(review, now)
+    hidden = h_cheap + h_loose + h_spread
+    samples = {s: [r for r in recs if is_recent(r.get("added"), now)] for s, recs in samples.items()}
+    samples = {s: recs for s, recs in samples.items() if recs}
 
     noset_samples = defaultdict(list)
     for r in records:
-        if not r.get("set_id") and len(noset_samples[r["store"]]) < 3:
+        if not r.get("set_id") and is_recent(r.get("added"), now) and len(noset_samples[r["store"]]) < 3:
             noset_samples[r["store"]].append(r)
 
     notes = [
@@ -1358,7 +1392,7 @@ def main():
     working, total, _ = store_summary(stats)
     new_total = sum(s["new"] for s in stats.values())
     html = build_html(spreads, cheaps, stats, notes, book, samples if args.dry_run else None, now, review, loose,
-                      noset_samples if args.dry_run else None)
+                      noset_samples if args.dry_run else None, hidden)
     subject = (f"MTG new singles: {len(cheaps)} cheap new listing(s), {len(loose)} set-unknown to check, "
                f"{len(spreads)} spread(s), {new_total} new scanned, {working}/{total} stores OK")
     if args.dry_run:

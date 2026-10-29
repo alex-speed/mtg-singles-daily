@@ -287,6 +287,10 @@ span[style*="background:#6a5acd"]{background:linear-gradient(135deg,#d6ccff,#9a8
   @keyframes glow{0%,100%{box-shadow:0 0 8px rgba(244,194,79,.35)}50%{box-shadow:0 0 18px rgba(244,194,79,.75)}}
 }
 
+/* rows with a listing added today (singles page) */
+tr[style*="#c8f7dc"]{background:transparent !important}
+tr[style*="#c8f7dc"] > td{background:rgba(94,234,150,.14)}
+tr[style*="#c8f7dc"] > td:first-child{box-shadow:inset 3px 0 0 #5eea96}
 /* the archive list */
 ul.archive{grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:.7rem;margin-top:1rem}
 ul.archive li{padding:0;border-radius:12px}
