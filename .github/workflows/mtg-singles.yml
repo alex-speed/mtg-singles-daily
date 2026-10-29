@@ -70,6 +70,7 @@ jobs:
       - name: Run bot and send email
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
         env:
+          NEW_DAYS: ${{ inputs.new_days || '2' }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           # Option A: Microsoft Graph. Used when SMTP_HOST is not set.
@@ -81,13 +82,19 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        run: python mtg_singles_bot.py --new-days ${{ inputs.new_days || '2' }} ${{ inputs.quick && '--max-pages 2' || '' }}
+        run: |
+          case "$NEW_DAYS" in ''|*[!0-9]*) echo "new_days must be a whole number"; exit 1 ;; esac
+          python mtg_singles_bot.py --new-days "$NEW_DAYS" ${{ inputs.quick && '--max-pages 2' || '' }}
 
       # Scheduled runs, and manual runs with dry run ticked, build report.html and attach it to the run.
       # A scheduled run has no inputs, so it reads every page with the 2 day window.
       - name: Run bot (dry run)
         if: ${{ github.event_name == 'schedule' || inputs.dry_run }}
-        run: python mtg_singles_bot.py --dry-run --new-days ${{ inputs.new_days || '2' }} ${{ inputs.quick && '--max-pages 2' || '' }}
+        env:
+          NEW_DAYS: ${{ inputs.new_days || '2' }}
+        run: |
+          case "$NEW_DAYS" in ''|*[!0-9]*) echo "new_days must be a whole number"; exit 1 ;; esac
+          python mtg_singles_bot.py --dry-run --new-days "$NEW_DAYS" ${{ inputs.quick && '--max-pages 2' || '' }}
 
       - name: Attach the report
         if: ${{ github.event_name == 'schedule' || inputs.dry_run }}
